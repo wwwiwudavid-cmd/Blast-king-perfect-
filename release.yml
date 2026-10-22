@@ -1,0 +1,86 @@
+# Signed release: .aab for Google Play + .apk for APKPure and other stores.
+# Needs 4 repository secrets: SIGNING_KEY_BASE64, KEY_ALIAS, KEYSTORE_PASSWORD, KEY_PASSWORD
+name: Release Blast King (signed AAB and APK)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find the project files
+        run: |
+          for z in *.zip; do [ -f "$z" ] && unzip -o -q "$z"; done
+          DIR=$(dirname "$(find . -name capacitor.config.json -not -path './node_modules/*' | head -n 1)")
+          if [ "$DIR" != "." ]; then cp -r "$DIR"/. .; fi
+          ls
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+      - run: npm install
+      - name: Prepare web and icon folders
+        run: |
+          mkdir -p www assets
+          cp index.html www/index.html
+          sed -i 's/testMode:true/testMode:false/' www/index.html
+          grep -q 'testMode:false' www/index.html
+          cp icon-only.png icon-foreground.png icon-background.png splash.png splash-dark.png assets/
+      - name: Protect the game code
+        run: |
+          if [ -f no-protect.txt ]; then echo "Protection switched off (no-protect.txt found)"; exit 0; fi
+          cp www/index.html www/index.unprotected.html
+          if npm install --no-save javascript-obfuscator@4 && node protect.js; then echo "Game code protected"; else echo "Protection failed - using the normal game file"; cp www/index.unprotected.html www/index.html; fi
+          rm -f www/index.unprotected.html
+
+      - run: npx cap add android
+      - name: Add the AdMob app ID
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q 'xmlns:tools' $M || sed -i 's#<manifest #<manifest xmlns:tools="http://schemas.android.com/tools" #' $M
+          sed -i 's#</application>#    <meta-data android:name="com.google.android.gms.ads.APPLICATION_ID" android:value="ca-app-pub-3844890569843097~2373574902" tools:replace="android:value" />\n    </application>#' $M
+          S=android/app/src/main/res/values/strings.xml
+          sed -i 's#</resources>#    <string name="admob_app_id">ca-app-pub-3844890569843097~2373574902</string>\n</resources>#' $S
+          grep -c 'ca-app-pub-3844890569843097~2373574902' $M $S
+      - run: npx capacitor-assets generate --android
+        continue-on-error: true
+      - run: sed -i 's/<activity\b/<activity android:screenOrientation="portrait"/' android/app/src/main/AndroidManifest.xml
+      - name: Raise the version number on every release
+        run: sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/" android/app/build.gradle
+      - run: npx cap sync android
+      - name: Build the release bundle and APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew bundleRelease assembleRelease
+      - name: Sign the bundle and the APK
+        env:
+          KS_B64: ${{ secrets.SIGNING_KEY_BASE64 }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          mkdir -p signed
+          AAB=$(find android/app/build/outputs/bundle/release -name '*.aab' | head -n 1)
+          cp "$AAB" signed/blast-king.aab
+          jarsigner -keystore "$RUNNER_TEMP/release.jks" -storepass "$KS_PASS" -keypass "$KS_KEYPASS" -sigalg SHA256withRSA -digestalg SHA-256 signed/blast-king.aab "$KS_ALIAS"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          APK=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          "$BT/zipalign" -p 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/release.jks" --ks-pass env:KS_PASS --key-pass env:KS_KEYPASS --ks-key-alias "$KS_ALIAS" --out signed/blast-king.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --verbose signed/blast-king.apk | head -5
+          rm -f "$RUNNER_TEMP/release.jks"
+      - name: Save the signed files
+        uses: actions/upload-artifact@v4
+        with:
+          name: blast-king-signed
+          path: signed/
